@@ -32,19 +32,22 @@ const TIMELINES = Object.fromEntries(
   Object.values(DOCS).map((d) => [d.id, buildTimeline(d.text)]),
 ) as Record<DocId, Timeline>;
 
+// Preferred voices, best first. Voices installed on the device are always tried before
+// online ones (like Chrome's "Google …" voices), which often start late or not at all.
 const VOICE_PREFS = [
-  /natural/i,
-  /Google UK English Female/i,
-  /Google US English/i,
   /Samantha/i,
   /Serena/i,
+  /Daniel/i,
   /Karen/i,
   /Moira/i,
-  /Daniel/i,
+  /natural/i,
   /Aria/i,
   /Jenny/i,
   /Libby/i,
   /Sonia/i,
+  /Zira/i,
+  /Google UK English Female/i,
+  /Google US English/i,
 ];
 
 function sentenceAt(tl: Timeline, t: number) {
@@ -63,7 +66,10 @@ export class SamplePlayer {
   private listeners = new Set<() => void>();
 
   private voices: SpeechSynthesisVoice[] = [];
-  private noVoice = false;
+  /** Voices that failed to speak; skipped from then on. */
+  private badVoices = new Set<string>();
+  /** Held so Chrome doesn't garbage-collect it mid-sentence and drop its `end` event. */
+  private utterance?: SpeechSynthesisUtterance;
   private token = 0;
   private sentence = 0;
   private speaking = false;
@@ -71,7 +77,6 @@ export class SamplePlayer {
   private spokeAt = 0;
   private lastTick = 0;
   private clock?: ReturnType<typeof setInterval>;
-  private sayTimer?: ReturnType<typeof setTimeout>;
   private watchdog?: ReturnType<typeof setTimeout>;
 
   subscribe = (listener: () => void) => {
@@ -171,17 +176,16 @@ export class SamplePlayer {
   private stop() {
     this.token++;
     clearInterval(this.clock);
-    clearTimeout(this.sayTimer);
     clearTimeout(this.watchdog);
     try {
       window.speechSynthesis?.cancel();
     } catch {}
+    this.utterance = undefined;
     this.speaking = false;
   }
 
   private voiceAvailable() {
     return (
-      !this.noVoice &&
       typeof window !== "undefined" &&
       !!window.speechSynthesis &&
       typeof SpeechSynthesisUtterance !== "undefined"
@@ -190,12 +194,17 @@ export class SamplePlayer {
 
   private pickVoice() {
     const all = this.voices.length ? this.voices : window.speechSynthesis.getVoices();
-    const en = all.filter((v) => /^en([-_]|$)/i.test(v.lang || ""));
-    for (const pref of VOICE_PREFS) {
-      const v = en.find((x) => pref.test(x.name));
+    const en = all.filter((v) => /^en([-_]|$)/i.test(v.lang || "") && !this.badVoices.has(v.voiceURI));
+    const local = en.filter((v) => v.localService);
+    for (const pool of [local, en]) {
+      for (const pref of VOICE_PREFS) {
+        const v = pool.find((x) => pref.test(x.name));
+        if (v) return v;
+      }
+      const v = pool.find((x) => x.default) ?? pool[0];
       if (v) return v;
     }
-    return en.find((v) => v.default) ?? en[0] ?? null;
+    return null;
   }
 
   /** Speak from sentence `i` onwards. Returns false when there is no voice to use. */
@@ -205,8 +214,12 @@ export class SamplePlayer {
     const tl = TIMELINES[this.state.cur];
     const token = ++this.token;
     try {
-      synth.cancel();
+      if (synth.speaking || synth.pending) synth.cancel();
+      // Chrome can get stuck paused, e.g. after the tab was in the background.
+      synth.resume();
     } catch {}
+    // One voice for the whole sample, so it doesn't change mid-page.
+    const voice = this.pickVoice();
 
     const say = (k: number) => {
       if (token !== this.token) return;
@@ -218,10 +231,9 @@ export class SamplePlayer {
       const u = new SpeechSynthesisUtterance(tl.sentences[k]);
       u.rate = 0.94;
       u.pitch = 1;
-      const v = this.pickVoice();
-      if (v) {
-        u.voice = v;
-        u.lang = v.lang;
+      if (voice) {
+        u.voice = voice;
+        u.lang = voice.lang;
       } else {
         u.lang = "en-GB";
       }
@@ -236,9 +248,12 @@ export class SamplePlayer {
         if (this.state.t < tl.marks[k + 1]) this.set({ t: tl.marks[k + 1] });
         say(k + 1);
       };
-      u.onerror = () => {
-        if (token === this.token) this.speaking = false;
+      u.onerror = (e) => {
+        if (token !== this.token || e.error === "interrupted" || e.error === "canceled") return;
+        if (voice) this.badVoices.add(voice.voiceURI);
+        this.speaking = false;
       };
+      this.utterance = u;
       try {
         synth.speak(u);
       } catch {
@@ -248,13 +263,15 @@ export class SamplePlayer {
 
     this.started = false;
     this.spokeAt = performance.now();
-    this.sayTimer = setTimeout(() => say(i), 80);
+    // Speak straight away, inside the click: Safari and iOS refuse speech that starts later.
+    say(i);
     clearTimeout(this.watchdog);
-    // Some browsers list voices but never speak. Fall back to the silent clock.
+    // Some voices are listed but never speak. Skip that voice next time and let the
+    // silent clock carry this play to the end.
     this.watchdog = setTimeout(() => {
       if (token !== this.token || this.started) return;
+      if (voice) this.badVoices.add(voice.voiceURI);
       this.speaking = false;
-      this.noVoice = true;
       try {
         synth.cancel();
       } catch {}
